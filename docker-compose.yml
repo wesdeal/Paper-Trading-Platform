@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trader
+      POSTGRES_DB: paper_trading
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes: [".:/code"]
+    ports: ["8000:8000"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://trader:trader@db:5432/paper_trading
+      REDIS_URL: redis://redis:6379
+    depends_on: [db, redis]
+
+volumes:
+  pgdata:

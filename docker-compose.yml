@@ -1,3 +1,5 @@
+
+# define services and wire them together in private network
 services:
   db:
     image: postgres:16
@@ -5,8 +7,10 @@ services:
       POSTGRES_USER: trader
       POSTGRES_PASSWORD: trader
       POSTGRES_DB: paper_trading
-    ports: ["5432:5432"]
-    volumes: ["pgdata:/var/lib/postgresql/data"]
+    ports: ["5433:5432"]
+    volumes:
+    - pgdata:/var/lib/postgresql/data
+    - ./init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql
 
   redis:
     image: redis:7
@@ -19,6 +23,7 @@ services:
     ports: ["8000:8000"]
     environment:
       DATABASE_URL: postgresql+asyncpg://trader:trader@db:5432/paper_trading
+      TEST_DATABASE_URL: postgresql+asyncpg://trader:trader@db:5432/paper_trading_test
       REDIS_URL: redis://redis:6379
     depends_on: [db, redis]
 

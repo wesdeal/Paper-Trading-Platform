@@ -21,6 +21,7 @@ services:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     volumes: [".:/code"]
     ports: ["8000:8000"]
+    env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://trader:trader@db:5432/paper_trading
       TEST_DATABASE_URL: postgresql+asyncpg://trader:trader@db:5432/paper_trading_test

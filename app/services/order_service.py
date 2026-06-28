@@ -60,123 +60,132 @@ async def place_order(db, account_id, ticker, side, quantity, price, idempotency
     price = Decimal(str(price))
 
     # check idempotency key
+    # outside of try statement because no lock yet. key doesn't need a lock because no actions are being taken on the account here besides grabbing data
     order_by_key = await get_order_by_idempotency_key(db, idempotency_key)
     if order_by_key is not None:
         print(f"Order already exists, {order_by_key}")
         return order_by_key
 
 
-    account = await get_account_for_update(db, account_id)
-
-    total_order_cost = price * quantity
-
-    # BUY side logic for Position
-    if side == "BUY":
-        if account.cash_balance < total_order_cost:
-            print("Insufficient funds")
-            return None # or some kind of error raise
-        
-        cash_direction="DEBIT"
-        position_direction="CREDIT"
-        
-        position = await get_position(db, account.id, ticker)
-
-        if position is None:
-            # create a new position for this BUY order. ]
-            new_position = Position(
-                account_id=account_id,
-                ticker=ticker,
-                quantity=quantity,
-                avg_cost_basis=price, # new position, avg cost basis is simple the fill price for the order
-            )
-            # add to db
-            db.add(new_position)
-        else: # position exists, need to update quantity, 
-            new_quantity = position.quantity + quantity
-
-            #calc new avg cost basis with simple formula: 
-            #((old quantity x old acb) + (order quanity x order fill price)) / new quantity
-            new_avg_cost_basis = ((position.quantity * position.avg_cost_basis) + (quantity * price)) / new_quantity
-            position.avg_cost_basis = new_avg_cost_basis
-
-            position.quantity = new_quantity
-
-            # no need to commit as the db.commit() happens at end of outter most function
-
-        # update cash balance
-        account.cash_balance -= total_order_cost
-
-
-    # SELL side logic for Position
-    elif side == "SELL":
-        cash_direction="CREDIT"
-        position_direction="DEBIT"
-        # position should exist if selling, but check anyway
-        position = await get_position(db, account.id, ticker)
-
-        if position is None:
-            # raise some sort of error but print and return for now.
-            print(f"Sell Error: You currently don't have a position for {ticker}.")
-            return None
-        else: 
-            # queck if they have enough shares to sell
-
-            if position.quantity < quantity:
-                # raise some sort of error but print and return is fine for now
-                print(f"Sell Error: Insufficent share quantity. Your current holding quantity: {position.quantity}. Your requested sell quantity: {quantity}.")
-                return None
-            
-            new_quantity = position.quantity - quantity
-            position.quantity = new_quantity
-
-            # avg cost basis does not get updated for a sell.
-            # update cash balance: 
-            account.cash_balance += total_order_cost
-    else:
-        print("Order error. Try again.")
-
-    # insert into order
-    new_order = Order(
-        account_id=account_id,
-        idempotency_key=idempotency_key,
-        ticker=ticker,
-        side=side,
-        order_type="MARKET",
-        quantity=quantity,
-        status="FILLED",
-    ) # order status default to pending...change to FILLED when??
-    db.add(new_order)
-    await db.flush()  # need new_order.id before creating execution/ledger rows
-
-    # insert into execution
-    new_execution = Execution(
-        order_id=new_order.id,
-        fill_quantity=quantity,
-        fill_price=price,
-    )
-    db.add(new_execution)
-
-    # ledger entry inserts: 1 for cash bal update, 1 for position update
-    ledger_cash_balance = LedgerEntry(
-        account_id=account_id,
-        order_id=new_order.id,
-        entry_type="TRADE",
-        amount=total_order_cost,
-        direction=cash_direction, # assigned in buy/sell logic
-    )
-    db.add(ledger_cash_balance)
     
-    ledger_position = LedgerEntry(
-        account_id=account_id,
-        order_id=new_order.id,
-        entry_type= "TRADE",
-        amount=total_order_cost,
-        direction=position_direction, # assigned in buy/sell logic
-    )
-    db.add(ledger_position)
+    try:
+        account = await get_account_for_update(db, account_id)
 
-    await db.commit()
+        # toss a string as quantity so its a decimal * str to throw exception
+        total_order_cost = price * quantity
 
-    return new_order
+        # BUY side logic for Position
+        if side == "BUY":
+            if account.cash_balance < total_order_cost:
+                print("Insufficient funds")
+                return None # or some kind of error raise
+                # doesn't handle the open transaction; no commit() or db_rollback()
+            
+            cash_direction="DEBIT"
+            position_direction="CREDIT"
+            
+            position = await get_position(db, account.id, ticker)
+
+            if position is None:
+                # create a new position for this BUY order. ]
+                new_position = Position(
+                    account_id=account_id,
+                    ticker=ticker,
+                    quantity=quantity,
+                    avg_cost_basis=price, # new position, avg cost basis is simple the fill price for the order
+                )
+                # add to db
+                db.add(new_position)
+            else: # position exists, need to update quantity, 
+                # NOTE: there is NO handle for 0 quantity. 0 * price = 0 price? 
+                new_quantity = position.quantity + quantity
+
+                #calc new avg cost basis with simple formula: 
+                #((old quantity x old acb) + (order quanity x order fill price)) / new quantity
+                new_avg_cost_basis = ((position.quantity * position.avg_cost_basis) + (quantity * price)) / new_quantity
+                position.avg_cost_basis = new_avg_cost_basis
+
+                position.quantity = new_quantity
+
+                # no need to commit as the db.commit() happens at end of outter most function
+
+            # update cash balance
+            account.cash_balance -= total_order_cost
+
+
+        # SELL side logic for Position
+        elif side == "SELL":
+            cash_direction="CREDIT"
+            position_direction="DEBIT"
+            # position should exist if selling, but check anyway
+            position = await get_position(db, account.id, ticker)
+
+            if position is None:
+                # raise some sort of error but print and return for now.
+                print(f"Sell Error: You currently don't have a position for {ticker}.")
+                return None # doesn't handle the open transaction; no commit() or db_rollback()
+            else: 
+                # queck if they have enough shares to sell
+
+                if position.quantity < quantity:
+                    # raise some sort of error but print and return is fine for now
+                    print(f"Sell Error: Insufficent share quantity. Your current holding quantity: {position.quantity}. Your requested sell quantity: {quantity}.")
+                    return None # doesn't handle the open transaction; no commit() or db_rollback()
+                
+                new_quantity = position.quantity - quantity
+                position.quantity = new_quantity
+
+                # avg cost basis does not get updated for a sell.
+                # update cash balance: 
+                account.cash_balance += total_order_cost
+        else:
+            print("Order error. Try again.")
+
+        # insert into order
+        new_order = Order(
+            account_id=account_id,
+            idempotency_key=idempotency_key,
+            ticker=ticker,
+            side=side,
+            order_type="MARKET",
+            quantity=quantity,
+            status="FILLED",
+        ) # order status default to pending...change to FILLED when??
+        db.add(new_order)
+        await db.flush()  # need new_order.id before creating execution/ledger rows
+
+        # insert into execution
+        new_execution = Execution(
+            order_id=new_order.id,
+            fill_quantity=quantity,
+            fill_price=price,
+        )
+        db.add(new_execution)
+
+        # ledger entry inserts: 1 for cash bal update, 1 for position update
+        ledger_cash_balance = LedgerEntry(
+            account_id=account_id,
+            order_id=new_order.id,
+            entry_type="TRADE",
+            amount=total_order_cost,
+            direction=cash_direction, # assigned in buy/sell logic
+        )
+        db.add(ledger_cash_balance)
+        
+        ledger_position = LedgerEntry(
+            account_id=account_id,
+            order_id=new_order.id,
+            entry_type= "TRADE",
+            amount=total_order_cost,
+            direction=position_direction, # assigned in buy/sell logic
+        )
+        db.add(ledger_position)
+
+        await db.commit()
+
+        return new_order
+    except Exception:
+        await db.rollback()
+        raise
 
 

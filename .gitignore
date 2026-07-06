@@ -1,4 +1,3 @@
-requirements-dev.txt
 .pytest_cache
 
 init-test-db.sql

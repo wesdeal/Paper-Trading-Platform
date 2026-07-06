@@ -27,3 +27,4 @@ class Account(Base):
     orders: Mapped[list["Order"]] = relationship(back_populates="account")
     positions: Mapped[list["Position"]] = relationship(back_populates="account")
     ledger_entries: Mapped[list["LedgerEntry"]] = relationship(back_populates="account")
+    snapshots: Mapped[list["PortfolioSnapshot"]] = relationship(back_populates="account")

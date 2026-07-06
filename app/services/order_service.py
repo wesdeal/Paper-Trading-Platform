@@ -1,4 +1,16 @@
-# pessamistic locking strategy to ensure 2 transactions dont conflict balances or each other
+# pessimistic locking strategy to ensure 2 transactions dont conflict balances or each other
+#
+# Order lifecycle:
+#   MARKET -> filled immediately inside place_order (status FILLED)
+#   LIMIT  -> stored as PENDING; a background worker calls fill_limit_order()
+#             when the live price crosses the limit. PENDING orders can be
+#             CANCELED; a fill that no longer passes the funds/shares check
+#             is marked REJECTED.
+#
+# Lock ordering (deadlock safety): fill_limit_order locks the order row first,
+# then the account row. cancel_order locks only the order row. place_order
+# locks only the account row. No path holds the account lock while waiting on
+# an order lock, so there is no cycle.
 
 from decimal import Decimal
 
@@ -12,136 +24,160 @@ from app.models.execution import Execution
 
 
 async def get_account_for_update(db, account_id) -> Account:
-
-    # use select() to query for an account by account_id
-    # use .scalar_one() to ensure only one result comes back; fails if none or multiple are pulled. account_id is unique and should pull one
-    account_query = select(Account).where(Account.id == account_id).with_for_update() # SELECT * FROM Account WHERE 
-
-    # execute on the db. Use await since this is async
+    account_query = select(Account).where(Account.id == account_id).with_for_update()
     result = await db.execute(account_query)
+    # scalar_one(): account_id is unique, anything else is a bug worth a 500
+    return result.scalar_one()
 
-    # use .scalar_one() to ensure only one result comes back; fails if none or multiple are pulled. account_id is unique and should pull one
-    account = result.scalar_one()
-    return account
-    # Note:
-    """ 
-     scalar_one() if fail will return a bland 500 server error. fine for now
-     build handles later to catch and classify as a more descriptive 404
-       """
 
 async def get_order_by_idempotency_key(db, idempotency_key) -> Order | None:
     key_query = select(Order).where(Order.idempotency_key == idempotency_key)
     result = await db.execute(key_query)
+    return result.scalar_one_or_none()
 
-    # .scalar_one_or_none() because it safely returns None if 0 results are found (good), raises only if 2 or more found
-    # if 1 if found, still returns an object but easy to check. means there is already an existing order in place.
-    existing_order = result.scalar_one_or_none() 
-    return existing_order 
 
 async def get_position(db, account_id, ticker) -> Position | None:
-    # select Position where account_id matches AND ticker matches
-    # no locking needed here -- why not? (hint: you're already holding
-    # the account lock from get_account_for_update -- does that protect
-    # this row too, given how account_id ties them together?)
-
-    # query for position | check if it exists (filter for account id and ticker)
-
+    # no separate lock needed: every writer already holds the account row lock,
+    # which serializes access to that account's positions
     position_query = select(Position).where(
         Position.account_id == account_id,
-        Position.ticker == ticker
-        )
-    
-    existing_position = (await db.execute(position_query)).scalar_one_or_none()
-    return existing_position
+        Position.ticker == ticker,
+    )
+    return (await db.execute(position_query)).scalar_one_or_none()
 
 
-async def place_order(db, account_id, ticker, side, quantity, price, idempotency_key) -> Order | None:
+async def _apply_fill(db, account: Account, order: Order, price: Decimal) -> bool:
+    """Move cash + shares and write the Execution and both LedgerEntry rows.
 
-    price = Decimal(str(price))
+    Caller must already hold the account row lock and owns the commit/rollback.
+    Returns False when the business check fails (insufficient funds/shares)
+    without touching anything.
+    """
+    quantity = order.quantity
+    total_cost = price * quantity
 
-    # check idempotency key
-    # outside of try statement because no lock yet. key doesn't need a lock because no actions are being taken on the account here besides grabbing data
+    if order.side == "BUY":
+        if account.cash_balance < total_cost:
+            return False
+
+        cash_direction = "DEBIT"
+        position_direction = "CREDIT"
+
+        position = await get_position(db, account.id, order.ticker)
+        if position is None:
+            db.add(Position(
+                account_id=account.id,
+                ticker=order.ticker,
+                quantity=quantity,
+                avg_cost_basis=price,  # first lot: basis is just the fill price
+            ))
+        else:
+            new_quantity = position.quantity + quantity
+            # weighted average: ((old qty * old basis) + (qty * fill price)) / new qty
+            position.avg_cost_basis = (
+                (position.quantity * position.avg_cost_basis) + (quantity * price)
+            ) / new_quantity
+            position.quantity = new_quantity
+
+        account.cash_balance -= total_cost
+
+    elif order.side == "SELL":
+        cash_direction = "CREDIT"
+        position_direction = "DEBIT"
+
+        position = await get_position(db, account.id, order.ticker)
+        if position is None or position.quantity < quantity:
+            return False
+
+        position.quantity -= quantity
+        # avg cost basis does not change on a sell
+        account.cash_balance += total_cost
+
+    else:
+        return False
+
+    await db.flush()  # need order.id persisted before the execution/ledger rows
+
+    db.add(Execution(
+        order_id=order.id,
+        fill_quantity=quantity,
+        fill_price=price,
+    ))
+    db.add(LedgerEntry(
+        account_id=account.id,
+        order_id=order.id,
+        entry_type="TRADE",
+        amount=total_cost,
+        direction=cash_direction,
+    ))
+    db.add(LedgerEntry(
+        account_id=account.id,
+        order_id=order.id,
+        entry_type="TRADE",
+        amount=total_cost,
+        direction=position_direction,
+    ))
+    return True
+
+
+async def place_order(
+    db, account_id, ticker, side, quantity, price, idempotency_key,
+    order_type="MARKET", limit_price=None,
+) -> Order | None:
+    """Create an order. MARKET orders fill atomically here; LIMIT orders are
+    stored PENDING for the background worker. Returns None on a business
+    rejection (insufficient funds/shares, bad side)."""
+
+    # idempotency check happens before any locks: it's read-only
     order_by_key = await get_order_by_idempotency_key(db, idempotency_key)
     if order_by_key is not None:
-        print(f"Order already exists, {order_by_key}")
         return order_by_key
 
+    if order_type == "LIMIT":
+        if limit_price is None:
+            raise ValueError("limit_price is required for LIMIT orders")
+        limit_price = Decimal(str(limit_price))
+        if limit_price <= 0:
+            raise ValueError("limit_price must be positive")
+    elif order_type == "MARKET":
+        price = Decimal(str(price))
+    else:
+        raise ValueError(f"Unsupported order_type: {order_type}")
 
-    
     try:
         account = await get_account_for_update(db, account_id)
 
-        # toss a string as quantity so its a decimal * str to throw exception
-        total_order_cost = price * quantity
+        if order_type == "LIMIT":
+            # advisory affordability check at placement time -- the worker
+            # re-checks under the lock at fill time, since balances move
+            if side == "BUY":
+                if account.cash_balance < limit_price * quantity:
+                    await db.rollback()
+                    return None
+            elif side == "SELL":
+                position = await get_position(db, account.id, ticker)
+                if position is None or position.quantity < quantity:
+                    await db.rollback()
+                    return None
+            else:
+                await db.rollback()
+                return None
 
-        # BUY side logic for Position
-        if side == "BUY":
-            if account.cash_balance < total_order_cost:
-                print("Insufficient funds")
-                return None # or some kind of error raise
-                # doesn't handle the open transaction; no commit() or db_rollback()
-            
-            cash_direction="DEBIT"
-            position_direction="CREDIT"
-            
-            position = await get_position(db, account.id, ticker)
+            new_order = Order(
+                account_id=account_id,
+                idempotency_key=idempotency_key,
+                ticker=ticker,
+                side=side,
+                order_type="LIMIT",
+                quantity=quantity,
+                limit_price=limit_price,
+                status="PENDING",
+            )
+            db.add(new_order)
+            await db.commit()
+            return new_order
 
-            if position is None:
-                # create a new position for this BUY order. ]
-                new_position = Position(
-                    account_id=account_id,
-                    ticker=ticker,
-                    quantity=quantity,
-                    avg_cost_basis=price, # new position, avg cost basis is simple the fill price for the order
-                )
-                # add to db
-                db.add(new_position)
-            else: # position exists, need to update quantity, 
-                # NOTE: there is NO handle for 0 quantity. 0 * price = 0 price? 
-                new_quantity = position.quantity + quantity
-
-                #calc new avg cost basis with simple formula: 
-                #((old quantity x old acb) + (order quanity x order fill price)) / new quantity
-                new_avg_cost_basis = ((position.quantity * position.avg_cost_basis) + (quantity * price)) / new_quantity
-                position.avg_cost_basis = new_avg_cost_basis
-
-                position.quantity = new_quantity
-
-                # no need to commit as the db.commit() happens at end of outter most function
-
-            # update cash balance
-            account.cash_balance -= total_order_cost
-
-
-        # SELL side logic for Position
-        elif side == "SELL":
-            cash_direction="CREDIT"
-            position_direction="DEBIT"
-            # position should exist if selling, but check anyway
-            position = await get_position(db, account.id, ticker)
-
-            if position is None:
-                # raise some sort of error but print and return for now.
-                print(f"Sell Error: You currently don't have a position for {ticker}.")
-                return None # doesn't handle the open transaction; no commit() or db_rollback()
-            else: 
-                # queck if they have enough shares to sell
-
-                if position.quantity < quantity:
-                    # raise some sort of error but print and return is fine for now
-                    print(f"Sell Error: Insufficent share quantity. Your current holding quantity: {position.quantity}. Your requested sell quantity: {quantity}.")
-                    return None # doesn't handle the open transaction; no commit() or db_rollback()
-                
-                new_quantity = position.quantity - quantity
-                position.quantity = new_quantity
-
-                # avg cost basis does not get updated for a sell.
-                # update cash balance: 
-                account.cash_balance += total_order_cost
-        else:
-            print("Order error. Try again.")
-
-        # insert into order
+        # MARKET: fill right now at the provided price
         new_order = Order(
             account_id=account_id,
             idempotency_key=idempotency_key,
@@ -150,42 +186,87 @@ async def place_order(db, account_id, ticker, side, quantity, price, idempotency
             order_type="MARKET",
             quantity=quantity,
             status="FILLED",
-        ) # order status default to pending...change to FILLED when??
+        )
         db.add(new_order)
-        await db.flush()  # need new_order.id before creating execution/ledger rows
 
-        # insert into execution
-        new_execution = Execution(
-            order_id=new_order.id,
-            fill_quantity=quantity,
-            fill_price=price,
-        )
-        db.add(new_execution)
-
-        # ledger entry inserts: 1 for cash bal update, 1 for position update
-        ledger_cash_balance = LedgerEntry(
-            account_id=account_id,
-            order_id=new_order.id,
-            entry_type="TRADE",
-            amount=total_order_cost,
-            direction=cash_direction, # assigned in buy/sell logic
-        )
-        db.add(ledger_cash_balance)
-        
-        ledger_position = LedgerEntry(
-            account_id=account_id,
-            order_id=new_order.id,
-            entry_type= "TRADE",
-            amount=total_order_cost,
-            direction=position_direction, # assigned in buy/sell logic
-        )
-        db.add(ledger_position)
+        filled = await _apply_fill(db, account, new_order, price)
+        if not filled:
+            await db.rollback()  # releases the account lock too
+            return None
 
         await db.commit()
-
         return new_order
     except Exception:
         await db.rollback()
         raise
 
 
+async def fill_limit_order(db, order_id, market_price) -> Order | None:
+    """Attempt to fill one PENDING LIMIT order at the given market price.
+
+    Re-checks everything under locks: the order may have been canceled or
+    filled since the worker read it, and the account balance may have moved.
+    Returns the order (FILLED or REJECTED) when it was acted on, None when
+    the limit condition isn't met or the order is no longer fillable.
+    """
+    market_price = Decimal(str(market_price))
+
+    try:
+        order_query = select(Order).where(Order.id == order_id).with_for_update()
+        order = (await db.execute(order_query)).scalar_one_or_none()
+
+        if order is None or order.status != "PENDING" or order.order_type != "LIMIT":
+            await db.rollback()
+            return None
+
+        buy_ready = order.side == "BUY" and market_price <= order.limit_price
+        sell_ready = order.side == "SELL" and market_price >= order.limit_price
+        if not (buy_ready or sell_ready):
+            await db.rollback()
+            return None
+
+        account = await get_account_for_update(db, order.account_id)
+
+        filled = await _apply_fill(db, account, order, market_price)
+        if not filled:
+            # funds/shares evaporated since placement: dead order, not retryable
+            order.status = "REJECTED"
+            await db.commit()
+            return order
+
+        order.status = "FILLED"
+        await db.commit()
+        return order
+    except Exception:
+        await db.rollback()
+        raise
+
+
+async def cancel_order(db, order_id, account_ids) -> Order:
+    """Cancel a PENDING order owned by one of account_ids.
+
+    Raises LookupError when the order doesn't exist / isn't theirs, and
+    ValueError when it's not cancelable. The order row lock makes this safe
+    against a concurrent fill_limit_order on the same order.
+    """
+    try:
+        order_query = select(Order).where(Order.id == order_id).with_for_update()
+        order = (await db.execute(order_query)).scalar_one_or_none()
+
+        if order is None or order.account_id not in account_ids:
+            await db.rollback()
+            raise LookupError("Order not found")
+
+        if order.status != "PENDING":
+            status = order.status  # read before rollback() expires the object
+            await db.rollback()
+            raise ValueError(f"Only PENDING orders can be canceled (status is {status})")
+
+        order.status = "CANCELED"
+        await db.commit()
+        return order
+    except (LookupError, ValueError):
+        raise
+    except Exception:
+        await db.rollback()
+        raise

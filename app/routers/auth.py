@@ -1,12 +1,33 @@
 from app.schemas.login import LoginRequest
+from app.schemas.account import AccountCreate
 from fastapi import APIRouter, Depends, HTTPException
 from app.database import get_db
 from app.models.user import User
 from sqlalchemy import select
 from app.core.security import create_access_token, verify_password
-from sqlalchemy.exc import MultipleResultsFound, NoResultFound
+from app.services.account_service import EmailAlreadyRegisteredError, create_user_with_account
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post("/register", status_code=201)
+async def register(account_in: AccountCreate, db = Depends(get_db)):
+    """Signup: creates the user + their paper account and returns a token so
+    the frontend can log straight in. Same logic as POST /accounts/."""
+    try:
+        user, account = await create_user_with_account(
+            db, account_in.email, account_in.password, account_in.starting_balance
+        )
+    except EmailAlreadyRegisteredError:
+        raise HTTPException(status_code=409, detail="That email is already registered")
+
+    token = create_access_token(str(user.id))
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "email": user.email,
+        "account_id": account.id,
+    }
 
 @router.post("/login")
 async def login(credentials: LoginRequest, db = Depends(get_db)):

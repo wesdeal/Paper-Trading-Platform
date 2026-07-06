@@ -1,0 +1,62 @@
+@import 'tailwindcss';
+
+/* dark mode is a .dark class on <html>, not the OS preference */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * Design tokens. Chart greens/reds were validated per-surface with the
+ * dataviz palette checks (lightness band, chroma, >=3:1 contrast); polarity
+ * is always doubled with a +/- sign or arrow, never color alone.
+ */
+:root {
+  --t-bg: #faf9f6;        /* warm off-white */
+  --t-surface: #ffffff;
+  --t-surface-2: #f1efe9;
+  --t-border: #e7e4dc;
+  --t-ink: #1c2430;
+  --t-ink-secondary: #5b6472;
+  --t-ink-muted: #8b93a1;
+  --t-accent: #50ad58;        /* brand pastel green: fills, focus rings */
+  --t-accent-strong: #2e8c3c; /* buttons, links, up-text on light */
+  --t-up: #2e8c3c;
+  --t-down: #c94040;
+}
+
+.dark {
+  --t-bg: #1a1f2e;        /* deep slate, not pure black */
+  --t-surface: #232938;
+  --t-surface-2: #2c3345;
+  --t-border: #343c50;
+  --t-ink: #eef0f4;
+  --t-ink-secondary: #a8b0bf;
+  --t-ink-muted: #7d8595;
+  --t-accent: #50ad58;
+  --t-accent-strong: #4aac57;
+  --t-up: #4aac57;
+  --t-down: #e86060;
+}
+
+@theme inline {
+  --color-bg: var(--t-bg);
+  --color-surface: var(--t-surface);
+  --color-surface-2: var(--t-surface-2);
+  --color-border: var(--t-border);
+  --color-ink: var(--t-ink);
+  --color-ink-secondary: var(--t-ink-secondary);
+  --color-ink-muted: var(--t-ink-muted);
+  --color-accent: var(--t-accent);
+  --color-accent-strong: var(--t-accent-strong);
+  --color-up: var(--t-up);
+  --color-down: var(--t-down);
+  --font-sans: 'Inter', 'InterVariable', ui-sans-serif, system-ui, sans-serif;
+}
+
+html {
+  font-family: var(--font-sans);
+  font-feature-settings: 'tnum'; /* tabular numerals: columns of money line up */
+}
+
+body {
+  @apply bg-bg text-ink antialiased;
+  transition: background-color 200ms ease, color 200ms ease;
+}

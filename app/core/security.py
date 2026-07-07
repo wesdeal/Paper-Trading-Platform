@@ -35,21 +35,16 @@ def verify_password(plain_password: str, password_hash: str) -> bool:
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
 
-def decode_token(token: str) -> str | None:
-    """Return the user_id from a valid token, or None. Shared by the HTTP
-    dependency below and the WebSocket handshake (which can't use headers)."""
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload.get("sub")
-    except JWTError:
-        return None
-
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db = Depends(get_db)):
     credentials_exception = HTTPException(status_code=401, detail="Could not validate credentials")
 
-    user_id = decode_token(token)
-    if user_id is None:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
         raise credentials_exception
 
     user_query = select(User).where(User.id == user_id)

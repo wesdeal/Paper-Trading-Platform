@@ -56,7 +56,7 @@ async def get_position(db, account_id, ticker) -> Position | None:
 
 
 async def place_order(db, account_id, ticker, side, quantity, price, idempotency_key) -> Order | None:
-
+    
     price = Decimal(str(price))
 
     # check idempotency key

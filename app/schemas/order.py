@@ -6,7 +6,6 @@ class OrderCreate(BaseModel):
     ticker: str
     side: str
     quantity: int
-    price: float
     idempotency_key: str
 
 class OrderResponse(BaseModel): # for when we return a successfully placed order:

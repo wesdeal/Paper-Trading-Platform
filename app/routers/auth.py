@@ -5,15 +5,16 @@ from app.models.user import User
 from sqlalchemy import select
 from app.core.security import create_access_token, verify_password
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound
+from fastapi.security import OAuth2PasswordRequestForm
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/login")
-async def login(credentials: LoginRequest, db = Depends(get_db)):
+async def login(credentials: OAuth2PasswordRequestForm = Depends(), db = Depends(get_db)):
     # 1. look up the User by email -- what should happen if no user has that email?
     #    (think back to get_order_by_idempotency_key vs get_account_for_update --
     #     which "shape" of missing-result handling fits here?)
-    user_query = select(User).where(User.email == credentials.email)
+    user_query = select(User).where(User.email == credentials.username)
     existing_user = (await db.execute(user_query)).scalar_one_or_none()
 
     if existing_user is None or not verify_password(credentials.password, existing_user.password_hash):

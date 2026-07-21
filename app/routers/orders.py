@@ -5,6 +5,7 @@ from app.schemas.order import OrderCreate
 from app.core.security import get_current_user
 from app.models.user import User
 from app.models.account import Account
+from app.services.quote_service import get_quote_from_cache
 from sqlalchemy import select
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -19,12 +20,20 @@ async def create_order(order_in: OrderCreate, db = Depends(get_db), current_user
     result = await db.execute(account_query)
     account = result.scalar_one_or_none()
 
+    
+
     if account is None:
         raise HTTPException(status_code=403, detail="Account not found or not yours")
+    
+    price = await get_quote_from_cache(order_in.ticker)
+    print(f"Price: of {order_in.ticker}: {price}")
+
+    if price is None:
+        raise HTTPException(status_code=400, detail="No quote available.")
 
     order = await place_order(
             db, account.id, order_in.ticker, order_in.side,
-            order_in.quantity, order_in.price, order_in.idempotency_key
+            order_in.quantity, price, order_in.idempotency_key
     )
 
     if order is None:

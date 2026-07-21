@@ -7,5 +7,6 @@ class Settings(BaseSettings):
     test_database_url: str
     redis_url: str
     secret_key: str
+    finn_api_key: str
 
 settings = Settings()

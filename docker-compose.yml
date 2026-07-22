@@ -28,5 +28,14 @@ services:
       REDIS_URL: redis://redis:6379
     depends_on: [db, redis]
 
+  worker:
+    build: .
+    command: arq app.worker.WorkerSettings
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql+asyncpg://trader:trader@db:5432/paper_trading
+    depends_on: [db, redis]
+
 volumes:
   pgdata:
